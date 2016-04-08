@@ -1,0 +1,190 @@
+#!/usr/bin/perl
+#
+#./clean_zabbix -h 1c1 -m 55 -y - очистить хост 1c1 от устаревших данных 55 айтемов и не задавать вопрос на очистку каждого
+use DBI;
+use strict;
+use utf8;
+no warnings;
+use Term::ANSIColor;
+use Time::HiRes qw(gettimeofday);
+use Getopt::Long;
+
+
+our $dbhost='localhost';
+our $dbport='3306';
+our $dbname='zabbix';
+our $dbuser='zabbix';
+our $dbpass='zabbix';
+
+my $help_message="The script deletes the old data from MySQL database that have not yet removed zabbix housekeeper. Only MySQL!!!
+In other databases is not tested!
+
+Usage:
+	./clean_zabbix [options]
+
+Options:
+	-h --help			print this help
+	-n --namehost=NAMEHOST		host name (h.name) in zabbix
+	-m --max=MAXITEMS		max clear items
+	-y --yes			yes for all (dangerous!) Use this option if you check script
+	-c --connect=INFOCONNECT	host,port,user,password,database (default $dbhost,$dbport,$dbuser,$dbpass,$dbname)
+	
+Example:
+
+1) ./clean_zabbix -c localhost,3306,zabbix,zabbix,zabbix
+Check all history items. If they found outdated information on the question of removal will be asked. Is it safe to use.
+
+2) ./clean_zabbix -c localhost,3306,zabbix,zabbix,zabbix -n server1
+If they found outdated information in server1 then the question will be asked to remove. Is it safe to use.
+
+3) ./clean_zabbix -c localhost,3306,zabbix,zabbix,zabbix -n server1 -m 5
+If they found outdated information in server1 then the question will be asked to remove. It will be analyzed and processed only the first 5 items. Is it safe to use.
+
+4) ./clean_zabbix -c localhost,3306,zabbix,zabbix,zabbix -n server1 -m 5 -y
+If they found outdated information in server1 and the data will be deleted immediately. It will be analyzed and removed history only the first 5 items. Dangerous!
+
+grenom 2016\n\n";
+my $timerunall=gettimeofday();
+my $hostname_for_delete='';
+my $max_items_for_delete=0;
+my $yes_for_delete=0;
+my $help=0;
+my $dbconnect="$dbhost,$dbport,$dbuser,$dbpass,$dbname";
+
+GetOptions("connect=s"=>\$dbconnect,"namehost=s"=>\$hostname_for_delete, "max=i"=>\$max_items_for_delete, "yes"=>\$yes_for_delete, "help|?"=>\$help);
+	if(length $dbconnect>0){
+	($dbhost,$dbport,$dbuser,$dbpass,$dbname)=split ',', $dbconnect;
+	#print "$dbhost,$dbport,$dbuser,$dbpass,$dbname\n";
+	}
+	if($help==1){
+	print $help_message;
+	exit(0);
+	}
+
+my $dbh = connectmysql();
+my $sth0;
+	if(length $hostname_for_delete>0){
+	$sth0 = $dbh->prepare("SELECT h.host, i.itemid, i.name, i.key_, i.history, i.value_type, i.delay FROM hosts h, items i WHERE i.flags in (4,0) and i.hostid=h.hostid and h.name like '$hostname_for_delete'");
+	}
+	else{
+	$sth0 = $dbh->prepare("SELECT h.host, i.itemid, i.name, i.key_, i.history, i.value_type, i.delay FROM hosts h, items i WHERE i.flags in (4,0) and i.hostid=h.hostid");
+	}
+
+my $n=$sth0->execute;
+my $timerun;
+
+
+my $i=0;
+	while(my ($host, $itemid, $iname, $ikey, $ihistory, $ivaltype, $idelay)=$sth0->fetchrow_array)
+	{
+	my $table=get_tablename($ivaltype);
+	my $clock_del=time()-(3600*24*$ihistory);
+
+	printf "Analyze table %.20s for %.20s (%.60s)...\n", $table, colored($host, 'green'), $ikey;
+	
+	my $sth1 = $dbh->prepare("SELECT count(h.itemid) FROM $table h WHERE h.itemid=$itemid and h.clock<$clock_del");
+	$n=$sth1->execute;
+	my ($items_for_delete)=$sth1->fetchrow_array;
+	$sth1->finish();
+	
+	
+		if($items_for_delete>0)
+		{
+		
+		$sth1 = $dbh->prepare("SELECT count(h.itemid) FROM $table h WHERE h.itemid=$itemid and h.clock>$clock_del");
+		$n=$sth1->execute;
+		my ($items_residue)=$sth1->fetchrow_array;
+		$sth1->finish();
+		
+		printf "Saves history - %.20s days / Period update - %.20s sec / It will be removed - %.20s / Remain after removal - %.20s\n", colored($ihistory, 'cyan'), $idelay, colored($items_for_delete, 'magenta'), colored($items_residue, 'magenta');
+		print "Start or skip? (y/N) ";
+		
+		
+		my $answer;
+			if($yes_for_delete==1){
+			$answer="y\n";
+			} else {
+			$answer=<>;
+			}
+		
+			if($answer eq "y\n"){
+			print "Started delete $items_for_delete lines of $table...\n";
+			$timerun=gettimeofday;
+			$sth1 = $dbh->prepare("delete from $table where itemid=$itemid and clock<$clock_del;");
+			$n=$sth1->execute;
+			$sth1->finish();
+			$timerun=gettimeofday()-$timerun;
+			print "$n lines removed in $timerun sec.\n"
+			}
+			else
+			{
+			print "Skip.";
+			}
+		} else {
+		print "No data to delete. Skip."
+		}
+	
+	print "\n_____________________________________________________________________________________________________________\n";
+		if($i>=$max_items_for_delete && $max_items_for_delete!=0) {
+		last;
+		}
+	$i++;
+	}
+
+$sth0->finish();
+$dbh->disconnect();
+$timerunall=gettimeofday()-$timerunall;
+print "\n\nTime running: $timerunall\n";
+
+
+
+
+
+
+
+sub connectmysql {
+my $sth;
+my $n;
+my $dbh = DBI->connect("DBI:mysql:dbname=$dbname;host=$dbhost;port=$dbport", $dbuser, $dbpass);
+$dbh->{'mysql_enable_utf8'} = 1;
+$sth = $dbh->prepare('SET NAMES \'utf8\'');
+$n=$sth->execute;
+$sth = $dbh->prepare('SET SESSION collation_connection = \'utf8_general_ci\'');
+$n=$sth->execute;
+return $dbh;
+}
+
+
+
+
+
+sub get_tablename {
+my $table=shift;
+	if($table==0)
+	{
+	return 'history';
+	}
+	elsif ($table==1)
+	{
+	return 'history_str';
+	}
+	elsif ($table==2)
+	{
+	return 'history_log';
+	}
+	elsif ($table==4)
+	{
+	return 'history_text';
+	}
+	elsif ($table==3)
+	{
+	return 'history_uint';
+	}
+	else
+	{
+	return '??????';
+	}
+return -1;
+}
+__END__
+
